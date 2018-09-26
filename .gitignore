@@ -1,0 +1,22 @@
+# public/private keys
+*.pem
+*.pub
+
+# terraform init
+**/.vscode/*
+
+# terraform init
+**/.terraform/*
+
+# .tfstate files
+*.tfstate
+*.tfstate.*
+
+# .tfvars files
+*.tfvars
+
+# .log files
+*.log
+
+# .exe files
+*.exe
