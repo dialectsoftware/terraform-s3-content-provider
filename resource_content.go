@@ -138,6 +138,42 @@ func resourceServerCreate(d *schema.ResourceData, m interface{}) error {
 }
 
 func resourceServerRead(d *schema.ResourceData, m interface{}) error {
+
+	bucket := d.Get("bucket").(string)
+
+	options := session.Options{SharedConfigState: session.SharedConfigEnable}
+	value, exists := d.GetOk("profile")
+	if exists {
+		options.Profile = fmt.Sprintf("%v", value)
+	}
+	value, exists = d.GetOk("region")
+	if exists {
+		options.Config = aws.Config{Region: aws.String(fmt.Sprintf("%v", value))}
+	}
+
+	// The session the S3 Uploader will use
+	sess := session.Must(session.NewSessionWithOptions(options))
+
+	// The session the S3 Uploader will use
+	client := s3.New(sess)
+
+	//resp, err := client.ListObjects(&s3.ListObjectsInput{Bucket: aws.String(bucket)})
+	files := map[string]string{}
+	// Example iterating over at most 3 pages of a ListObjects operation.
+	err := client.ListObjectsPages(&s3.ListObjectsInput{Bucket: aws.String(bucket)},
+		func(page *s3.ListObjectsOutput, lastPage bool) bool {
+			for _, value := range page.Contents {
+				key := fmt.Sprintf("%v", *value.Key)
+				path := d.Id() + "\\" + strings.Replace(key, "/", "\\", -1)
+				files[path] = key
+			}
+			return !lastPage
+		})
+
+	if err != nil {
+		return fmt.Errorf("Unable to list items in bucket %q, %v", bucket, err)
+	}
+	d.Set("files", files)
 	return nil
 }
 
