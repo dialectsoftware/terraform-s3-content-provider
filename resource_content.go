@@ -2,14 +2,7 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/hashicorp/terraform/helper/customdiff"
 	"github.com/hashicorp/terraform/helper/schema"
 )
@@ -25,11 +18,11 @@ func resourceServer() *schema.Resource {
 				return d.Id() != ""
 			},
 			func(d *schema.ResourceDiff, meta interface{}) error {
-				files, err := enumerateFiles(d.Id())
+				contentManager, err := NewContentManager(d.Id())
 				if err != nil {
 					return err
 				}
-				d.SetNew("files", files)
+				d.SetNew("files", contentManager.Files)
 				return nil
 			},
 		),
@@ -64,92 +57,20 @@ func resourceServer() *schema.Resource {
 	}
 }
 
-func schemaDiffSuppressFunc(k, old, new string, d *schema.ResourceData) bool {
-	return false
-}
-
 func resourceServerCreate(d *schema.ResourceData, m interface{}) error {
-
-	mappings := map[string]string{
-		".html":  "text/html",
-		".htm":   "text/html",
-		".css":   "text/css",
-		".scss":  "text/less",
-		".gif":   "image/gif",
-		".ico":   "image/x-icon",
-		".jpg":   "image/jpeg",
-		".jpeg":  "image/jpeg",
-		".js":    "application/javascript",
-		".json":  "application/json",
-		".mpeg":  "video/mpeg",
-		".png":   "image/png",
-		".svg":   "image/svg+xml",
-		".swf":   "application/x-shockwave-flash",
-		".ts":    "application/typescript",
-		".woff":  "font/woff",
-		".woff2": "font/woff2",
-		".xhtml": "application/xhtml+xml",
-		".xml":   "application/xml",
-	}
-	value, exists := d.GetOk("types")
-	if exists {
-		mapInterface := value.(map[string]interface{})
-		for key, value := range mapInterface {
-			strKey := fmt.Sprintf("%v", key)
-			strValue := fmt.Sprintf("%v", value)
-			mappings[strKey] = strValue
-		}
-	}
-
 	path := d.Get("path").(string)
 	bucket := d.Get("bucket").(string)
-
-	options := session.Options{SharedConfigState: session.SharedConfigEnable}
-	value, exists = d.GetOk("profile")
-	if exists {
-		options.Profile = fmt.Sprintf("%v", value)
-	}
-	value, exists = d.GetOk("region")
-	if exists {
-		options.Config = aws.Config{Region: aws.String(fmt.Sprintf("%v", value))}
-	}
-
-	// The session the S3 Uploader will use
-	sess := session.Must(session.NewSessionWithOptions(options))
-
-	// Create an uploader with the session and default options
-	uploader := s3manager.NewUploader(sess)
-
-	files, err := enumerateFiles(path)
+	value, _ := d.GetOk("types")
+	contentManager, err := NewContentManager(path)
 	if err != nil {
 		return err
 	}
-	for key, value := range files {
-		file := fmt.Sprintf("%v", key)
-		uri := fmt.Sprintf("%v", value)
-		extension := filepath.Ext(file)
 
-		f, err := os.Open(file)
-		if err != nil {
-			return fmt.Errorf("failed to open file %q, %v", file, err)
-		}
-		_, err = uploader.Upload(&s3manager.UploadInput{
-			Bucket:      aws.String(bucket),
-			Key:         aws.String(uri),
-			Body:        f,
-			ContentType: aws.String(mappings[extension]),
-		})
-		f.Close()
-
-		if err != nil {
-			return fmt.Errorf("%q upload to s3 failed %v", file, err)
-		}
-	}
-
-	d.Set("files", files)
+	err = contentManager.Write(d, bucket, contentManager.Files, value.(map[string]interface{}))
 	if err != nil {
-		return fmt.Errorf("filepath.Walk of %q failed %v", path, err)
+		return err
 	}
+	d.Set("files", contentManager.Files)
 	d.SetId(path)
 	return nil
 }
@@ -157,103 +78,75 @@ func resourceServerCreate(d *schema.ResourceData, m interface{}) error {
 func resourceServerRead(d *schema.ResourceData, m interface{}) error {
 
 	bucket := d.Get("bucket").(string)
-
-	options := session.Options{SharedConfigState: session.SharedConfigEnable}
-	value, exists := d.GetOk("profile")
-	if exists {
-		options.Profile = fmt.Sprintf("%v", value)
-	}
-	value, exists = d.GetOk("region")
-	if exists {
-		options.Config = aws.Config{Region: aws.String(fmt.Sprintf("%v", value))}
-	}
-
-	// The session the S3 Uploader will use
-	sess := session.Must(session.NewSessionWithOptions(options))
-
-	// The session the S3 Uploader will use
-	client := s3.New(sess)
-
-	//resp, err := client.ListObjects(&s3.ListObjectsInput{Bucket: aws.String(bucket)})
-	files := map[string]string{}
-	// Example iterating over at most 3 pages of a ListObjects operation.
-	err := client.ListObjectsPages(&s3.ListObjectsInput{Bucket: aws.String(bucket)},
-		func(page *s3.ListObjectsOutput, lastPage bool) bool {
-			for _, value := range page.Contents {
-				key := fmt.Sprintf("%v", *value.Key)
-				path := d.Id() + "\\" + strings.Replace(key, "/", "\\", -1)
-				files[path] = key
-			}
-			return !lastPage
-		})
-
+	contentManager, err := NewContentManager(d.Id())
 	if err != nil {
-		return fmt.Errorf("Unable to list items in bucket %q, %v", bucket, err)
+		return err
 	}
+
+	files, err := contentManager.Read(d, bucket)
+	if err != nil {
+		return err
+	}
+
 	d.Set("files", files)
 	return nil
 }
 
 func resourceServerUpdate(d *schema.ResourceData, m interface{}) error {
+
+	path := d.Get("path").(string)
+	bucket := d.Get("bucket").(string)
+	mappings, _ := d.GetOk("types")
+
+	if d.HasChange("files") {
+		old, new := d.GetChange("files")
+		oldValue := old.(map[string]interface{})
+		newValue := new.(map[string]interface{})
+		contentManager, err := NewContentManager(path)
+		if err != nil {
+			return err
+		}
+
+		remove := make(map[string]interface{})
+		for key, value := range oldValue {
+			file := fmt.Sprintf("%v", key)
+			uri := fmt.Sprintf("%v", value)
+			if _, ok := newValue[file]; !ok {
+				remove[file] = uri
+			}
+		}
+		err = contentManager.Delete(d, bucket, remove)
+		if err != nil {
+			return err
+		}
+
+		add := make(map[string]interface{})
+		for key, value := range newValue {
+			file := fmt.Sprintf("%v", key)
+			uri := fmt.Sprintf("%v", value)
+			if _, ok := oldValue[file]; !ok {
+				add[file] = uri
+			}
+		}
+		err = contentManager.Write(d, bucket, add, mappings.(map[string]interface{}))
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func resourceServerDelete(d *schema.ResourceData, m interface{}) error {
-	// d.SetId("") is automatically called assuming delete returns no errors, but
-	// it is added here for explicitness.
-	value, exists := d.GetOk("files")
-	if exists {
-		files := value.(map[string]interface{})
-		options := session.Options{SharedConfigState: session.SharedConfigEnable}
-
-		value, exists = d.GetOk("profile")
-		if exists {
-			options.Profile = fmt.Sprintf("%v", value)
-		}
-		value, exists = d.GetOk("region")
-		if exists {
-			options.Config = aws.Config{Region: aws.String(fmt.Sprintf("%v", value))}
-		}
-
-		// The session the S3 Uploader will use
-		sess := session.Must(session.NewSessionWithOptions(options))
-
-		// Create an batcher with the session and default options
-		batcher := s3manager.NewBatchDelete(sess)
-
-		objects := []s3manager.BatchDeleteObject{} //s3.DeleteObjectInput{}
-
-		bucket := d.Get("bucket").(string)
-		for _, value := range files {
-			strValue := fmt.Sprintf("%v", value)
-			objects = append(objects, s3manager.BatchDeleteObject{
-				Object: &s3.DeleteObjectInput{
-					Key:    aws.String(strValue),
-					Bucket: aws.String(bucket),
-				},
-			})
-		}
-
-		if err := batcher.Delete(aws.BackgroundContext(), &s3manager.DeleteObjectsIterator{
-			Objects: objects,
-		}); err != nil {
-			return fmt.Errorf("batch of %q failed %v", bucket, err)
-		}
-
+	files, _ := d.GetOk("files")
+	bucket := d.Get("bucket").(string)
+	contentManager, err := NewContentManager(d.Id())
+	if err != nil {
+		return err
+	}
+	err = contentManager.Delete(d, bucket, files.(map[string]interface{}))
+	if err != nil {
+		return err
 	}
 	d.SetId("")
 	return nil
-}
-
-func enumerateFiles(path string) (map[string]string, error) {
-	files := map[string]string{}
-	err := filepath.Walk(path, func(file string, info os.FileInfo, err error) error {
-		if !info.IsDir() {
-			var filename = strings.Replace(strings.Replace(file, path+"\\", "", 1), "\\", "/", -1)
-			files[file] = filename
-		}
-		return nil
-	})
-	return files, err
-
 }

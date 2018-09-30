@@ -39,4 +39,8 @@ resource "aws_s3_bucket" "s3-content-test" {
 resource "s3_content" "my-content" {
     path = "content" 
     bucket = "${aws_s3_bucket.s3-content-test.bucket}"   
+    types = {
+      ".flux" = "text/flux"
+
+    }
 }
