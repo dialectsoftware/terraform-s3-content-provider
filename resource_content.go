@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/hashicorp/terraform/helper/customdiff"
 	"github.com/hashicorp/terraform/helper/schema"
 )
 
@@ -19,7 +20,19 @@ func resourceServer() *schema.Resource {
 		Read:   resourceServerRead,
 		Update: resourceServerUpdate,
 		Delete: resourceServerDelete,
-
+		CustomizeDiff: customdiff.If(
+			func(d *schema.ResourceDiff, meta interface{}) bool {
+				return d.Id() != ""
+			},
+			func(d *schema.ResourceDiff, meta interface{}) error {
+				files, err := enumerateFiles(d.Id())
+				if err != nil {
+					return err
+				}
+				d.SetNew("files", files)
+				return nil
+			},
+		),
 		Schema: map[string]*schema.Schema{
 			"path": &schema.Schema{
 				Type:     schema.TypeString,
@@ -45,11 +58,14 @@ func resourceServer() *schema.Resource {
 			"files": &schema.Schema{
 				Type:     schema.TypeMap,
 				Computed: true,
-				Optional: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 			},
 		},
 	}
+}
+
+func schemaDiffSuppressFunc(k, old, new string, d *schema.ResourceData) bool {
+	return false
 }
 
 func resourceServerCreate(d *schema.ResourceData, m interface{}) error {
@@ -104,31 +120,32 @@ func resourceServerCreate(d *schema.ResourceData, m interface{}) error {
 	// Create an uploader with the session and default options
 	uploader := s3manager.NewUploader(sess)
 
-	files := map[string]string{}
-	err := filepath.Walk(path, func(file string, info os.FileInfo, err error) error {
-		if !info.IsDir() {
-			f, err := os.Open(file)
-			if err != nil {
-				return fmt.Errorf("failed to open file %q, %v", file, err)
-			}
-			var extension = filepath.Ext(file)
-			var filename = strings.Replace(strings.Replace(file, path+"\\", "", 1), "\\", "/", -1)
-			_, err = uploader.Upload(&s3manager.UploadInput{
-				Bucket:      aws.String(bucket),
-				Key:         aws.String(filename),
-				Body:        f,
-				ContentType: aws.String(mappings[extension]),
-			})
-			f.Close()
+	files, err := enumerateFiles(path)
+	if err != nil {
+		return err
+	}
+	for key, value := range files {
+		file := fmt.Sprintf("%v", key)
+		uri := fmt.Sprintf("%v", value)
+		extension := filepath.Ext(file)
 
-			if err != nil {
-				return fmt.Errorf("%q upload to s3 failed %v", file, err)
-			}
-
-			files[file] = filename
+		f, err := os.Open(file)
+		if err != nil {
+			return fmt.Errorf("failed to open file %q, %v", file, err)
 		}
-		return nil
-	})
+		_, err = uploader.Upload(&s3manager.UploadInput{
+			Bucket:      aws.String(bucket),
+			Key:         aws.String(uri),
+			Body:        f,
+			ContentType: aws.String(mappings[extension]),
+		})
+		f.Close()
+
+		if err != nil {
+			return fmt.Errorf("%q upload to s3 failed %v", file, err)
+		}
+	}
+
 	d.Set("files", files)
 	if err != nil {
 		return fmt.Errorf("filepath.Walk of %q failed %v", path, err)
@@ -226,4 +243,17 @@ func resourceServerDelete(d *schema.ResourceData, m interface{}) error {
 	}
 	d.SetId("")
 	return nil
+}
+
+func enumerateFiles(path string) (map[string]string, error) {
+	files := map[string]string{}
+	err := filepath.Walk(path, func(file string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			var filename = strings.Replace(strings.Replace(file, path+"\\", "", 1), "\\", "/", -1)
+			files[file] = filename
+		}
+		return nil
+	})
+	return files, err
+
 }
